@@ -246,10 +246,7 @@ static bool parse_args(const std::vector<std::string>& args, Config& config) {
     for (size_t i = 1; i < args.size(); i++) {
         const std::string& arg = args[i];
 
-        if (arg == "-h" || arg == "--help") {
-            print_usage();
-            return false;
-        } else if (arg == "-f")    config.show_filename = true;
+        if      (arg == "-f")    config.show_filename = true;
         else if (arg == "-fe")     config.show_filename_ext = true;
         else if (arg == "-fea")    config.show_filepath = true;
         else if (arg == "-sr")     config.show_sample_rate = true;
@@ -733,6 +730,12 @@ int app_main(int argc, char* argv[]) {
 #endif
 
     std::vector<std::string> args = get_utf8_args(argc, argv);
+
+    if (std::find(args.begin() + std::min<size_t>(1, args.size()), args.end(), "-h") != args.end() ||
+        std::find(args.begin() + std::min<size_t>(1, args.size()), args.end(), "--help") != args.end()) {
+        print_usage();
+        return 0;
+    }
 
     if (args.size() < 2) {
         print_usage();

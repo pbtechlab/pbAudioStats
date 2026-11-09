@@ -6,6 +6,10 @@ target_compile_features(pbAudioStats_regression PRIVATE cxx_std_17)
 
 add_test(NAME pbAudioStats.regression COMMAND pbAudioStats_regression)
 
+if(TARGET pbAudioStats)
+    add_test(NAME pbAudioStats.cli_help COMMAND pbAudioStats -h)
+endif()
+
 set(PB_CONSUMER_COMMON_ARGS
     -DPB_AUDIO_STATS_SOURCE=${PROJECT_SOURCE_DIR}
     -DPB_AUDIO_STATS_BINARY=${PROJECT_BINARY_DIR}
