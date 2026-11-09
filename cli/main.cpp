@@ -19,6 +19,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -222,7 +223,7 @@ static bool parse_norm_option(const std::string& arg, Config& config) {
     } catch (...) {
         return false;
     }
-    if (pos != value_str.size()) return false;  // Reject "-23xx"
+    if (pos != value_str.size() || !std::isfinite(config.norm_value)) return false;
 
     config.normalize = true;
 
@@ -491,8 +492,8 @@ static void process_files_parallel(const std::vector<FileEntry>& entries,
     results.resize(total);
     if (total == 0) return;
 
-    // Analysis is CPU-bound and per-file memory is bounded (files above the
-    // 32MB streaming threshold are analyzed in a single bounded-memory pass),
+    // Analysis is CPU-bound and per-file memory is bounded (full analysis
+    // streams when decoded frames exceed AnalysisOptions' byte budget),
     // so use every core by default. An explicit -j is honored as-is.
     const int num_threads = pick_thread_count(config.num_threads, total, /*hard_cap=*/0);
 
@@ -502,6 +503,14 @@ static void process_files_parallel(const std::vector<FileEntry>& entries,
     std::atomic<size_t> completed{0};
     std::mutex progress_mutex;
 
+    AnalysisOptions analysis_options;
+    analysis_options.sample_peak = config.show_sample_peak;
+    analysis_options.true_peak = config.show_true_peak;
+    analysis_options.loudness = config.show_integrated || config.show_shortterm ||
+                                config.show_momentary || config.show_lra;
+    analysis_options.rms = config.show_rms_min || config.show_rms_max ||
+                           config.show_rms_avg;
+
     auto worker = [&]() {
         while (!g_cancelled.load(std::memory_order_relaxed)) {
             size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
@@ -510,7 +519,7 @@ static void process_files_parallel(const std::vector<FileEntry>& entries,
             // A single corrupt file (or an unexpected exception) must not
             // call std::terminate and kill the entire batch.
             try {
-                results[idx] = analyze(entries[idx].path);
+                results[idx] = analyze(entries[idx].path, analysis_options);
             } catch (...) {
                 results[idx] = AudioStats{};
                 results[idx].valid = false;
@@ -563,9 +572,10 @@ static int process_normalize(const Config& config) {
         std::cout << "Normalizing: " << input << "\n";
         std::cout << "  Target: " << config.norm_value << " dB\n";
 
-        if (!Normalizer::normalize_and_save(input, output,
-                                            config.norm_target, config.norm_value)) {
-            std::cerr << "Error: Failed to normalize file.\n";
+        const auto result = Normalizer::normalize_and_save_detailed(
+            input, output, config.norm_target, config.norm_value);
+        if (!result) {
+            std::cerr << "Error: " << result.message << "\n";
             return 1;
         }
         std::cout << "  Output: " << output << "\n";
@@ -614,14 +624,26 @@ static int process_normalize(const Config& config) {
         return 1;
     }
 
-    // Normalization holds whole files in memory (decode + write chunk), so
-    // gate admission by a byte budget instead of a blanket low thread cap.
+    // Normalization holds whole decoded files in memory, so gate admission by
+    // a byte budget derived from stream metadata rather than container bytes.
     const int num_threads = pick_thread_count(config.num_threads, entries.size(),
                                               /*hard_cap=*/12);
     const uint64_t budget = std::max<uint64_t>(total_physical_ram() / 3, 1ull << 30);
-    auto estimate_bytes = [](uintmax_t file_size) -> uint64_t {
-        // float expansion (up to 4x for 8-bit, 2x for 16-bit) + write chunk
-        return std::max<uint64_t>(static_cast<uint64_t>(file_size) * 3, 64ull << 20);
+    auto estimate_bytes = [](const FileEntry& entry) -> uint64_t {
+        constexpr uint64_t work_buffers = 8ull << 20;
+        auto stream = AudioReader::open_stream(entry.path);
+        if (!stream || stream->info.channels == 0) {
+            return std::max<uint64_t>(static_cast<uint64_t>(entry.size) * 4,
+                                      64ull << 20);
+        }
+        const uint64_t frames = stream->info.total_frames;
+        const uint64_t channels = stream->info.channels;
+        if (frames > (std::numeric_limits<uint64_t>::max() - work_buffers) /
+                         channels / sizeof(float)) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        // Exact decoded float payload plus fixed reader/writer/DSP chunks.
+        return frames * channels * sizeof(float) + work_buffers;
     };
 
     std::mutex mem_mutex;
@@ -642,7 +664,7 @@ static int process_normalize(const Config& config) {
             size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
             if (idx >= total) break;
 
-            const uint64_t est = estimate_bytes(entries[idx].size);
+            const uint64_t est = estimate_bytes(entries[idx]);
             {
                 std::unique_lock<std::mutex> lk(mem_mutex);
                 mem_cv.wait(lk, [&] {

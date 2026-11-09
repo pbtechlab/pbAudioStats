@@ -13,6 +13,7 @@
 #include "pbAudioStats.h"
 #include "pbSimd.h"
 #include "pbTruePeakScanner.h"
+#include "pbValidation.h"
 
 #include <cmath>
 #include <limits>
@@ -20,9 +21,8 @@
 namespace pb_audio {
 
 double TruePeakMeter::measure(const AudioData& audio, double known_sample_peak_linear) {
-    if (audio.samples.empty() || audio.channels == 0 || audio.total_frames == 0) {
-        return -std::numeric_limits<double>::infinity();
-    }
+    const auto validation = detail::validate_audio_data(audio);
+    if (!validation.valid) return std::numeric_limits<double>::quiet_NaN();
 
     tp_detail::TruePeakScanner scanner(audio.channels);
 
@@ -30,8 +30,7 @@ double TruePeakMeter::measure(const AudioData& audio, double known_sample_peak_l
     // Seeding up front also makes chunk pruning effective from the start.
     double sample_peak = known_sample_peak_linear;
     if (sample_peak < 0.0) {
-        sample_peak = static_cast<double>(
-            simd::find_peak_abs(audio.samples.data(), audio.samples.size()));
+        sample_peak = static_cast<double>(validation.sample_peak);
     }
     scanner.seed_peak(sample_peak);
 

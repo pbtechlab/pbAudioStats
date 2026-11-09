@@ -26,6 +26,8 @@
  */
 
 #include "pbAudioStats.h"
+#include "pbRmsCore.h"
+#include "pbValidation.h"
 #include "pbSimd.h"
 #include "pbTruePeakScanner.h"
 
@@ -52,7 +54,7 @@ static constexpr int SHORTTERM_PARTITION = 3;       // 67% overlap (3 partitions
 
 // Histogram settings
 static constexpr double HIST_MIN_DB = -70.0;
-static constexpr double HIST_MAX_DB = 5.0;
+static constexpr double HIST_MAX_DB = 100.0;
 static constexpr int HIST_GRAIN = 100;              // 0.01 dB resolution
 static constexpr int HIST_NBINS = static_cast<int>(HIST_GRAIN * (HIST_MAX_DB - HIST_MIN_DB) + 1);
 
@@ -92,28 +94,9 @@ static inline double denormalize(double x) {
 
 namespace {
 
-// RAII guard: set FTZ (flush-to-zero) + DAZ (denormals-are-zero) on x86 so the
-// IIR/EMA decay tails cannot hit denormal slowpaths; restores MXCSR on exit.
-// Values this small are ~-300 dB and far below the -70 LUFS absolute gate and
-// the displayed precision, so measurement results are unaffected.
-struct DenormalGuard {
-#if defined(PB_SIMD_AVX2)
-    unsigned int old_csr;
-    DenormalGuard() : old_csr(_mm_getcsr()) {
-        _mm_setcsr(old_csr | 0x8040u);  // FTZ (bit 15) | DAZ (bit 6)
-    }
-    ~DenormalGuard() { _mm_setcsr(old_csr); }
-#else
-    DenormalGuard() {}
-#endif
-    DenormalGuard(const DenormalGuard&) = delete;
-    DenormalGuard& operator=(const DenormalGuard&) = delete;
-};
-
-}  // namespace
-
-// ============================================================================
-// Biquad Filter State
+// DenormalGuard is declared in pbAudioStats.h so the shared RMS core can use it
+// too. Values flushed here are ~-300 dB, far below the -70 LUFS absolute gate
+// and the displayed precision, so measurement results are unaffected.
 // ============================================================================
 
 class BiquadFilter {
@@ -263,6 +246,28 @@ static double get_channel_weight(int channel_index, int total_channels) {
         case 8:  // 7.1: L R C LFE Lrs Rrs Ls Rs
             if (channel_index == 3) return 0.0;
             return (channel_index >= 4) ? SURROUND_WEIGHT : 1.0;
+        default:
+            return 1.0;
+    }
+}
+
+// AUD-06: when the real channel layout is known (WAV channel mask, AIFF channel
+// arrangement), the weight follows the role instead of the physical index. A
+// quad file with an explicit FL/FR/FC/LFE mask must not be treated as 4x1.0.
+static double get_role_weight(ChannelRole role) {
+    static const double SURROUND_WEIGHT = std::pow(10.0, 0.15);
+    switch (role) {
+        case ChannelRole::Left:
+        case ChannelRole::Right:
+        case ChannelRole::Center:
+            return 1.0;
+        case ChannelRole::LFE:
+            return 0.0;                       // BS.1770 excludes the LFE
+        case ChannelRole::LeftSurround:
+        case ChannelRole::RightSurround:
+        case ChannelRole::LeftRearSurround:
+        case ChannelRole::RightRearSurround:
+            return SURROUND_WEIGHT;
         default:
             return 1.0;
     }
@@ -498,9 +503,11 @@ public:
 
     int channels;
     std::vector<double> channel_weights;
+    std::vector<ChannelRole> channel_roles;   // empty = layout unknown (legacy estimate)
 
-    KWeightingFilter(double sample_rate, int num_channels)
-        : channels(num_channels) {
+    KWeightingFilter(double sample_rate, int num_channels,
+                     const std::vector<ChannelRole>& roles)
+        : channels(num_channels), channel_roles(roles) {
 
         // Initialize filters from 48kHz reference
         BiquadFilter ref_shelf, ref_hp;
@@ -514,10 +521,15 @@ public:
         shelf_states.resize(num_channels);
         hp_states.resize(num_channels);
 
-        // Initialize channel weights
+        // Initialize channel weights: role-based when the layout is known,
+        // otherwise the legacy position estimate from the channel count.
         channel_weights.resize(num_channels);
         for (int i = 0; i < num_channels; ++i) {
-            channel_weights[i] = get_channel_weight(i, num_channels);
+            if (!channel_roles.empty()) {
+                channel_weights[i] = get_role_weight(channel_roles[static_cast<size_t>(i)]);
+            } else {
+                channel_weights[i] = get_channel_weight(i, num_channels);
+            }
         }
     }
 
@@ -686,126 +698,9 @@ private:
 // SOX-compatible RMS EMA state (chunk-batched, recurrence kept in registers)
 // ============================================================================
 
-namespace {
-
-struct RmsChannelState {
-    double avg_sigma_x2 = 0.0;
-    double max_sigma_x2 = 0.0;
-    double min_sigma_x2 = std::numeric_limits<double>::max();
-    double sum_sq = 0.0;
-};
-
-class RmsBatch {
-public:
-    RmsBatch(int channels, double sample_rate, double window_ms)
-        : channels_(channels), states_(channels) {
-        const double time_constant = window_ms / 1000.0;
-        mult_ = std::exp(-1.0 / (time_constant * sample_rate));
-        one_minus_mult_ = 1.0 - mult_;
-        tc_samples_ = static_cast<uint64_t>(5.0 * time_constant * sample_rate);
-    }
-
-    uint64_t tc_samples() const { return tc_samples_; }
-
-    // Process `frames` interleaved frames whose first frame has measurement
-    // index `start_index` (frame index within the measured region). Min/max
-    // tracking begins at index >= tc_samples (SOX settling behavior).
-    void process(const float* samples, size_t frames, uint64_t start_index) {
-        // Split at the settling boundary so the inner loops are branch-free.
-        size_t pre = 0;
-        if (start_index < tc_samples_) {
-            uint64_t remaining = tc_samples_ - start_index;
-            pre = static_cast<size_t>(
-                std::min<uint64_t>(remaining, static_cast<uint64_t>(frames)));
-        }
-
-        const int nch = channels_;
-        for (int ch = 0; ch < nch; ++ch) {
-            RmsChannelState& st = states_[ch];
-            double avg = st.avg_sigma_x2;
-            double mx = st.max_sigma_x2;
-            double mn = st.min_sigma_x2;
-            double ssq = st.sum_sq;
-            const float* src = samples + ch;
-
-            size_t f = 0;
-            for (; f < pre; ++f) {
-                double s = static_cast<double>(src[f * nch]);
-                double sq = s * s;
-                ssq += sq;
-                avg = avg * mult_ + one_minus_mult_ * sq;
-            }
-            for (; f < frames; ++f) {
-                double s = static_cast<double>(src[f * nch]);
-                double sq = s * s;
-                ssq += sq;
-                avg = avg * mult_ + one_minus_mult_ * sq;
-                if (avg > mx) mx = avg;
-                if (avg < mn) mn = avg;
-            }
-
-            st.avg_sigma_x2 = avg;
-            st.max_sigma_x2 = mx;
-            st.min_sigma_x2 = mn;
-            st.sum_sq = ssq;
-        }
-    }
-
-    // SOX behavior for inputs shorter than the settling time: use the overall
-    // average power as both peak and trough.
-    void finalize(uint64_t measured_frames) {
-        if (measured_frames > 0 && measured_frames < tc_samples_) {
-            for (int ch = 0; ch < channels_; ++ch) {
-                double avg_power = states_[ch].sum_sq / static_cast<double>(measured_frames);
-                states_[ch].max_sigma_x2 = avg_power;
-                states_[ch].min_sigma_x2 = avg_power;
-            }
-        }
-    }
-
-    void fill_results(uint64_t measured_frames, double& rms_min, double& rms_max,
-                      double& rms_average) const {
-        rms_min = -96.0;
-        rms_max = -96.0;
-        rms_average = -96.0;
-
-        double total_sum_sq = 0.0;
-        for (int ch = 0; ch < channels_; ++ch) total_sum_sq += states_[ch].sum_sq;
-
-        const uint64_t total_sample_count =
-            measured_frames * static_cast<uint64_t>(channels_);
-        if (total_sample_count > 0 && total_sum_sq > 0.0) {
-            double avg_rms = std::sqrt(total_sum_sq / static_cast<double>(total_sample_count));
-            rms_average = 20.0 * std::log10(avg_rms);
-        }
-
-        double overall_max = 0.0;
-        for (int ch = 0; ch < channels_; ++ch) {
-            if (states_[ch].max_sigma_x2 > overall_max) overall_max = states_[ch].max_sigma_x2;
-        }
-        if (overall_max > 0.0) {
-            rms_max = 20.0 * std::log10(std::sqrt(overall_max));
-        }
-
-        double overall_min = std::numeric_limits<double>::max();
-        for (int ch = 0; ch < channels_; ++ch) {
-            if (states_[ch].min_sigma_x2 < overall_min) overall_min = states_[ch].min_sigma_x2;
-        }
-        if (overall_min > 0.0 && overall_min < std::numeric_limits<double>::max()) {
-            double min_db = 20.0 * std::log10(std::sqrt(overall_min));
-            rms_min = std::isinf(min_db) ? -96.0 : min_db;
-        }
-    }
-
-private:
-    int channels_;
-    double mult_;
-    double one_minus_mult_;
-    uint64_t tc_samples_;
-    std::vector<RmsChannelState> states_;
-};
-
 }  // namespace
+// The RMS EMA state lives in the shared core (RmsCore, pbRms.cpp) so the
+// standalone meter and the loudness path can never disagree.
 
 // ============================================================================
 // Public API: LoudnessMeter::calc_high_shelf / calc_high_pass
@@ -845,11 +740,12 @@ static LoudnessBuffer prepare_loudness_buffer(const std::vector<float>& samples,
                                               size_t original_frames,
                                               int channels,
                                               uint32_t sample_rate,
-                                              std::vector<float>& looped_storage) {
+                                              std::vector<float>& looped_storage,
+                                              bool repeat_short_audio) {
     double duration_ms = (static_cast<double>(original_frames) * 1000.0) / sample_rate;
     constexpr double MIN_DURATION_MS = 4000.0;
 
-    if (duration_ms >= MIN_DURATION_MS || original_frames == 0) {
+    if (!repeat_short_audio || duration_ms >= MIN_DURATION_MS || original_frames == 0) {
         return {samples.data(), original_frames, 0};
     }
 
@@ -904,6 +800,11 @@ static void finalize_loudness_result(LoudnessMeter::Result& r,
 // ============================================================================
 
 LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
+    return measure(audio, MeasurementOptions{});
+}
+
+LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio,
+                                             const MeasurementOptions& options) {
     Result result = {
         SILENCE_THRESHOLD,  // integrated
         SILENCE_THRESHOLD,  // momentary_max
@@ -912,7 +813,8 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
         -std::numeric_limits<double>::infinity()  // sample_peak
     };
 
-    if (audio.samples.empty() || audio.channels == 0 || audio.sample_rate == 0) {
+    const auto validation = detail::validate_audio_data(audio);
+    if (!validation.valid) {
         return result;
     }
 
@@ -923,7 +825,7 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
 
     // Track sample peak from ORIGINAL audio (pre-loop, pre-filter)
     const size_t total_samples = audio.total_frames * static_cast<size_t>(channels);
-    float sample_peak_linear = simd::find_peak_abs(audio.samples.data(), total_samples);
+    float sample_peak_linear = validation.sample_peak;
 
     if (sample_peak_linear > 0.0f) {
         result.sample_peak = 20.0 * std::log10(static_cast<double>(sample_peak_linear));
@@ -934,12 +836,13 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
     // Loop short audio to minimum length for accurate BS.1770-4 measurement
     std::vector<float> looped_samples;
     LoudnessBuffer buf = prepare_loudness_buffer(
-        audio.samples, audio.total_frames, channels, audio.sample_rate, looped_samples);
+        audio.samples, audio.total_frames, channels, audio.sample_rate, looped_samples,
+        options.short_audio_policy == ShortAudioPolicy::RepeatToFourSeconds);
     const float* samples = buf.samples;
     const size_t total_frames = buf.total_frames;
     const size_t warmup_frames = buf.warmup_frames;
 
-    KWeightingFilter kfilter(sample_rate, channels);
+    KWeightingFilter kfilter(sample_rate, channels, audio.channel_roles);
     BlockAggregator momentary(sample_rate, MOMENTARY_BLOCK_MS, MOMENTARY_PARTITION);
     BlockAggregator shortterm(sample_rate, SHORTTERM_BLOCK_MS, SHORTTERM_PARTITION);
     LoudnessHistogram momentary_histogram;
@@ -971,6 +874,9 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
 
     finalize_loudness_result(result, momentary, shortterm,
                              momentary_histogram, shortterm_histogram);
+    result.valid = true;
+    result.short_audio_repeated = audio.duration_seconds() < 4.0 &&
+        options.short_audio_policy == ShortAudioPolicy::RepeatToFourSeconds;
     return result;
 }
 
@@ -981,6 +887,15 @@ LoudnessMeter::Result LoudnessMeter::measure(const AudioData& audio) {
 LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& audio,
                                                               double window_ms,
                                                               double known_sample_peak_linear) {
+    MeasurementOptions options;
+    options.rms_window_ms = window_ms;
+    return measure_with_rms(audio, options, known_sample_peak_linear);
+}
+
+LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(
+        const AudioData& audio,
+        const MeasurementOptions& options,
+        double known_sample_peak_linear) {
     ExtendedResult out = {};
     out.loudness = {
         SILENCE_THRESHOLD,
@@ -994,7 +909,9 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     out.rms_average = -96.0;
     out.true_peak = -std::numeric_limits<double>::infinity();
 
-    if (audio.samples.empty() || audio.channels == 0 || audio.sample_rate == 0) {
+    const auto validation = detail::validate_audio_data(audio);
+    if (!validation.valid || !std::isfinite(options.rms_window_ms) ||
+        options.rms_window_ms <= 0.0) {
         return out;
     }
 
@@ -1007,8 +924,7 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     // Sample peak from original audio only (reuse caller's scan if provided)
     double sample_peak_linear = known_sample_peak_linear;
     if (sample_peak_linear < 0.0) {
-        sample_peak_linear = static_cast<double>(simd::find_peak_abs(
-            audio.samples.data(), original_frames * static_cast<size_t>(channels)));
+        sample_peak_linear = static_cast<double>(validation.sample_peak);
     }
     if (sample_peak_linear > 0.0) {
         out.loudness.sample_peak = 20.0 * std::log10(sample_peak_linear);
@@ -1017,18 +933,20 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
     // Loop short audio to minimum length for accurate BS.1770-4 measurement
     std::vector<float> looped_samples;
     LoudnessBuffer buf = prepare_loudness_buffer(
-        audio.samples, original_frames, channels, audio.sample_rate, looped_samples);
+        audio.samples, original_frames, channels, audio.sample_rate, looped_samples,
+        options.short_audio_policy == ShortAudioPolicy::RepeatToFourSeconds);
     const float* samples = buf.samples;
     const size_t total_frames = buf.total_frames;
     const size_t warmup_frames = buf.warmup_frames;
     const size_t rms_end = warmup_frames + original_frames;  // RMS covers the real audio window
 
-    KWeightingFilter kfilter(sample_rate, channels);
+    KWeightingFilter kfilter(sample_rate, channels, audio.channel_roles);
     BlockAggregator momentary(sample_rate, MOMENTARY_BLOCK_MS, MOMENTARY_PARTITION);
     BlockAggregator shortterm(sample_rate, SHORTTERM_BLOCK_MS, SHORTTERM_PARTITION);
     LoudnessHistogram momentary_histogram;
     LoudnessHistogram shortterm_histogram;
-    RmsBatch rms(channels, sample_rate, window_ms);
+    RmsCore rms(static_cast<uint32_t>(sample_rate), static_cast<uint16_t>(channels),
+                options.rms_window_ms);
 
     std::vector<double> weighted_sq_batch(BATCH_FRAMES);
 
@@ -1066,7 +984,14 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
                              momentary_histogram, shortterm_histogram);
 
     rms.finalize(original_frames);
-    rms.fill_results(original_frames, out.rms_min, out.rms_max, out.rms_average);
+    const RmsResult r = rms.result();
+    out.rms_min = r.min_db;
+    out.rms_max = r.max_db;
+    out.rms_average = r.average_db;
+    out.loudness.valid = true;
+    out.loudness.short_audio_repeated = audio.duration_seconds() < 4.0 &&
+        options.short_audio_policy == ShortAudioPolicy::RepeatToFourSeconds;
+    out.valid = true;
 
     return out;
 }
@@ -1079,6 +1004,13 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_with_rms(const AudioData& a
 // ============================================================================
 
 LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream, double window_ms) {
+    MeasurementOptions options;
+    options.rms_window_ms = window_ms;
+    return measure_stream(stream, options);
+}
+
+LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(
+        AudioStream& stream, const MeasurementOptions& options) {
     ExtendedResult out = {};
     out.loudness = {
         SILENCE_THRESHOLD,
@@ -1093,7 +1025,8 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     out.true_peak = -std::numeric_limits<double>::infinity();
 
     const auto info = stream.info;
-    if (info.channels == 0 || info.sample_rate == 0) {
+    if (!detail::validate_stream_info(info) || !std::isfinite(options.rms_window_ms) ||
+        options.rms_window_ms <= 0.0) {
         return out;
     }
 
@@ -1105,12 +1038,13 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     float sample_peak_linear = 0.0f;
     uint64_t total_frames = 0;
 
-    KWeightingFilter kfilter(sample_rate, channels);
+    KWeightingFilter kfilter(sample_rate, channels, info.channel_roles);
     BlockAggregator momentary(sample_rate, MOMENTARY_BLOCK_MS, MOMENTARY_PARTITION);
     BlockAggregator shortterm(sample_rate, SHORTTERM_BLOCK_MS, SHORTTERM_PARTITION);
     LoudnessHistogram momentary_histogram;
     LoudnessHistogram shortterm_histogram;
-    RmsBatch rms(channels, sample_rate, window_ms);
+    RmsCore rms(static_cast<uint32_t>(sample_rate), static_cast<uint16_t>(channels),
+                options.rms_window_ms);
     tp_detail::TruePeakScanner truepeak(channels);
 
     constexpr double MIN_DURATION_MS = 4000.0;
@@ -1141,8 +1075,13 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
             break;
         }
 
+        const size_t sample_count = frames_read * static_cast<size_t>(channels);
+        for (size_t i = 0; i < sample_count; ++i) {
+            if (!std::isfinite(chunk[i])) return out;
+        }
+
         float chunk_peak = simd::find_peak_abs(chunk.data(),
-                                               frames_read * static_cast<size_t>(channels));
+                                               sample_count);
         if (chunk_peak > sample_peak_linear) {
             sample_peak_linear = chunk_peak;
         }
@@ -1184,7 +1123,8 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
         }
     }
 
-    if (!loudness_started && buffered_frames > 0) {
+    if (!loudness_started && buffered_frames > 0 &&
+        options.short_audio_policy == ShortAudioPolicy::RepeatToFourSeconds) {
         size_t loops_for_min = (min_frames + buffered_frames - 1) / buffered_frames;
         // Warmup loop: pass through K-weighting filter, do not register blocks
         size_t f = 0;
@@ -1198,6 +1138,10 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
         for (size_t loop = 0; loop < loops_for_min; ++loop) {
             process_loudness_frames(short_buffer.data(), buffered_frames);
         }
+    }
+    if (!loudness_started && buffered_frames > 0 &&
+        options.short_audio_policy == ShortAudioPolicy::DoNotRepeat) {
+        process_loudness_frames(short_buffer.data(), buffered_frames);
     }
 
     finalize_loudness_result(out.loudness, momentary, shortterm,
@@ -1216,7 +1160,14 @@ LoudnessMeter::ExtendedResult LoudnessMeter::measure_stream(AudioStream& stream,
     }
 
     rms.finalize(total_frames);
-    rms.fill_results(total_frames, out.rms_min, out.rms_max, out.rms_average);
+    const RmsResult r = rms.result();
+    out.rms_min = r.min_db;
+    out.rms_max = r.max_db;
+    out.rms_average = r.average_db;
+    out.loudness.valid = true;
+    out.loudness.short_audio_repeated = total_frames < min_frames &&
+        options.short_audio_policy == ShortAudioPolicy::RepeatToFourSeconds;
+    out.valid = true;
 
     return out;
 }

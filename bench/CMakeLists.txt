@@ -1,0 +1,8 @@
+add_executable(pbAudioStats_memory_benchmark memory_benchmark.cpp)
+pb_apply_msvc_runtime(pbAudioStats_memory_benchmark)
+target_link_libraries(pbAudioStats_memory_benchmark PRIVATE pbAudioStatsLib)
+target_compile_features(pbAudioStats_memory_benchmark PRIVATE cxx_std_17)
+
+if(WIN32)
+    target_link_libraries(pbAudioStats_memory_benchmark PRIVATE psapi)
+endif()

@@ -33,9 +33,9 @@ namespace pb_audio {
 namespace tp_detail {
 
 constexpr int OVERSAMPLE = 4;
-constexpr int TAPS_PER_PHASE = 12;
-constexpr int TOTAL_TAPS = OVERSAMPLE * TAPS_PER_PHASE;  // 48
-constexpr int HISTORY = TAPS_PER_PHASE - 1;              // 11
+constexpr int TAPS_PER_PHASE = 24;
+constexpr int TOTAL_TAPS = OVERSAMPLE * TAPS_PER_PHASE;  // 96-tap prototype
+constexpr int HISTORY = TAPS_PER_PHASE - 1;
 constexpr size_t CHUNK_FRAMES = 4096;
 
 #ifndef M_PI
@@ -63,7 +63,10 @@ struct PhaseTable {
 inline PhaseTable build_phase_table() {
     double proto[TOTAL_TAPS];
     const double cutoff = M_PI / static_cast<double>(OVERSAMPLE);
-    const double center = (static_cast<double>(TOTAL_TAPS) - 1.0) * 0.5;
+    // Use an integer high-rate group delay. A half-sample center shifts the
+    // four output phases by 1/8 input sample, which causes a deterministic
+    // -0.30 dB miss for a 16 kHz sine sampled at 48 kHz.
+    const double center = static_cast<double>(TOTAL_TAPS) * 0.5;
     const double beta = 9.6;
     const double i0_beta = bessel_i0(beta);
 

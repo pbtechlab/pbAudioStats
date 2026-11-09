@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.16)
+project(pbAudioStatsConsumer LANGUAGES CXX)
+
+if(PB_CONSUMER_STATIC_RUNTIME AND MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+if(PB_MODE STREQUAL "add_subdirectory")
+    set(PB_BUILD_CLI OFF CACHE BOOL "" FORCE)
+    set(PB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(PB_BUILD_STAGE_BENCH OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${PB_AUDIO_STATS_SOURCE}" pbAudioStats)
+elseif(PB_MODE STREQUAL "install")
+    find_package(pbAudioStats CONFIG REQUIRED)
+else()
+    message(FATAL_ERROR "Unknown PB_MODE: ${PB_MODE}")
+endif()
+
+add_executable(pbAudioStats_consumer main.cpp)
+target_link_libraries(pbAudioStats_consumer PRIVATE pbAudioStats::pbAudioStats)
+target_compile_features(pbAudioStats_consumer PRIVATE cxx_std_17)

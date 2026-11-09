@@ -17,7 +17,9 @@
  */
 
 #include "pbAudioStats.h"
+#include "pbAudioReaderTestHooks.h"
 #include "pbSimd.h"
+#include <atomic>
 #include <fstream>
 #include <filesystem>
 #include <cstring>
@@ -33,6 +35,20 @@
 namespace fs = std::filesystem;
 
 namespace pb_audio {
+
+namespace {
+std::atomic<uint64_t> g_decoded_frame_count{0};
+}
+
+namespace detail {
+void reset_decoded_frame_count() {
+    g_decoded_frame_count.store(0, std::memory_order_relaxed);
+}
+
+uint64_t decoded_frame_count() {
+    return g_decoded_frame_count.load(std::memory_order_relaxed);
+}
+}  // namespace detail
 
 // ============================================================================
 // UTF-8 path helpers (Windows: wide path; others: as-is)
@@ -106,6 +122,36 @@ constexpr uint16_t WAVE_FORMAT_PCM = 0x0001;
 constexpr uint16_t WAVE_FORMAT_IEEE_FLOAT = 0x0003;
 constexpr uint16_t WAVE_FORMAT_EXTENSIBLE = 0xFFFE;
 
+static std::vector<ChannelRole> roles_from_wave_mask(uint32_t mask, uint16_t channels) {
+    struct Mapping { uint32_t bit; ChannelRole role; };
+    static constexpr Mapping mappings[] = {
+        {0x00000001u, ChannelRole::Left},
+        {0x00000002u, ChannelRole::Right},
+        {0x00000004u, ChannelRole::Center},
+        {0x00000008u, ChannelRole::LFE},
+        {0x00000010u, ChannelRole::LeftRearSurround},
+        {0x00000020u, ChannelRole::RightRearSurround},
+        {0x00000200u, ChannelRole::LeftSurround},
+        {0x00000400u, ChannelRole::RightSurround},
+    };
+
+    std::vector<ChannelRole> roles;
+    if (mask == 0) return roles;
+    for (uint32_t bit = 1; bit != 0; bit <<= 1) {
+        if ((mask & bit) == 0) continue;
+        ChannelRole role = ChannelRole::Unknown;
+        for (const auto& mapping : mappings) {
+            if (mapping.bit == bit) {
+                role = mapping.role;
+                break;
+            }
+        }
+        roles.push_back(role);
+    }
+    if (roles.size() != channels) roles.clear();
+    return roles;
+}
+
 class WavStream final : public AudioStream {
 public:
     explicit WavStream(const std::string& filepath) : file(open_binary(filepath)) {
@@ -124,6 +170,7 @@ public:
         uint16_t channels = 0;
         uint32_t sample_rate = 0;
         uint16_t bits_per_sample = 0;
+        uint32_t channel_mask = 0;
         uint64_t data_offset = 0;
         uint64_t data_size = 0;
 
@@ -154,6 +201,7 @@ public:
                     // Resolve the real format from the SubFormat GUID
                     // (first two bytes hold the equivalent format tag).
                     if (chunk_size < 40) return;
+                    channel_mask = read_u32_le(fmt + 20);
                     audio_format = read_u16_le(fmt + 24);
                 }
 
@@ -209,6 +257,7 @@ public:
         info.channels = channels;
         info.bit_depth = bits_per_sample;
         info.total_frames = total_frames;
+        info.channel_roles = roles_from_wave_mask(channel_mask, channels);
 
         audio_format_ = audio_format;
         bytes_per_frame_ = static_cast<size_t>(channels) * bytes_per_sample;
@@ -226,6 +275,7 @@ public:
 
         size_t frames_to_read = static_cast<size_t>(
             std::min<uint64_t>(frames_remaining_, static_cast<uint64_t>(max_frames)));
+        g_decoded_frame_count.fetch_add(frames_to_read, std::memory_order_relaxed);
         size_t bytes_to_read = frames_to_read * bytes_per_frame_;
         if (bytes_to_read == 0) return 0;
 
@@ -412,6 +462,7 @@ public:
 
         size_t frames_to_read = static_cast<size_t>(
             std::min<uint64_t>(frames_remaining_, static_cast<uint64_t>(max_frames)));
+        g_decoded_frame_count.fetch_add(frames_to_read, std::memory_order_relaxed);
         size_t bytes_to_read = frames_to_read * bytes_per_frame_;
         if (bytes_to_read == 0) return 0;
 
@@ -591,6 +642,7 @@ public:
     size_t read_frames(float* buffer, size_t max_frames) override {
         if (!valid_) return 0;
         drmp3_uint64 frames = drmp3_read_pcm_frames_f32(&mp3_, static_cast<drmp3_uint64>(max_frames), buffer);
+        g_decoded_frame_count.fetch_add(static_cast<uint64_t>(frames), std::memory_order_relaxed);
         return static_cast<size_t>(frames);
     }
 
@@ -674,6 +726,7 @@ static std::unique_ptr<AudioData> load_via_stream(AudioStream& stream) {
     audio->channels = stream.info.channels;
     audio->bit_depth = stream.info.bit_depth;
     audio->total_frames = stream.info.total_frames;
+    audio->channel_roles = stream.info.channel_roles;
     if (audio->channels == 0 || audio->total_frames == 0) {
         return audio;
     }

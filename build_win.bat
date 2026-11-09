@@ -26,7 +26,7 @@ cd "%BUILD_DIR%"
 REM Configure with CMake (Visual Studio 2022, x64)
 echo.
 echo [1/2] Configuring with CMake...
-cmake -G "Visual Studio 17 2022" -A x64 ..
+cmake -G "Visual Studio 17 2022" -A x64 -DPB_USE_STATIC_MSVC_RUNTIME=ON ..
 if errorlevel 1 (
     echo ERROR: CMake configuration failed!
     exit /b 1
@@ -46,8 +46,8 @@ echo.
 echo ============================================
 echo Build completed successfully!
 echo ============================================
-echo Executable: %BUILD_DIR%\%BUILD_TYPE%\pbAudioStats.exe
-echo Library:    %BUILD_DIR%\%BUILD_TYPE%\pbAudioStatsLib.lib
+echo Executable: %BUILD_DIR%\cli\%BUILD_TYPE%\pbAudioStats.exe
+echo Library:    %BUILD_DIR%\lib\%BUILD_TYPE%\pbAudioStatsLib.lib
 
 REM Return to original directory
 cd ..

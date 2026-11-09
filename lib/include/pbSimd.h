@@ -70,8 +70,14 @@ inline float find_peak_abs(const float* data, size_t count) {
     return max_val;
 }
 
-// 4-lane horizontal sum of __m256d
-static inline double hsum_pd(__m256d v) {
+// 4-lane horizontal sum of __m256d. Force inlining on GCC/MinGW too: passing
+// a 256-bit vector to an out-of-line helper in an unoptimized build can use a
+// stack alignment that violates the AVX ABI and crash before the first op.
+#if defined(_MSC_VER)
+static __forceinline double hsum_pd(__m256d v) {
+#else
+static inline __attribute__((always_inline)) double hsum_pd(__m256d v) {
+#endif
     __m128d hi = _mm256_extractf128_pd(v, 1);
     __m128d lo = _mm256_castpd256_pd128(v);
     __m128d s = _mm_add_pd(lo, hi);
