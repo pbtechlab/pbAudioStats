@@ -250,6 +250,13 @@ public:
         RMSAverage
     };
 
+    // Inclusive normalization range. Endpoint order is intentionally ignored:
+    // { -15.0, -27.0 } and { -27.0, -15.0 } describe the same range.
+    struct TargetRange {
+        double first;
+        double second;
+    };
+
     // Returns gain in dB needed to normalize to target.
     // Returns NaN when the target is unreachable (non-finite current value).
     static double calculate_gain(const AudioStats& stats, Target target, double target_value);
@@ -307,6 +314,19 @@ public:
                                    double target_value,
                                    const OutputOptions& options);
 
+    // Clamp the measured target metric into the inclusive range. Audio already
+    // inside the range is written with unity gain.
+    static bool normalize_and_save(const std::string& input_path,
+                                   const std::string& output_path,
+                                   Target target,
+                                   TargetRange target_range);
+
+    static bool normalize_and_save(const std::string& input_path,
+                                   const std::string& output_path,
+                                   Target target,
+                                   TargetRange target_range,
+                                   const OutputOptions& options);
+
     static Result normalize_and_save_detailed(const std::string& input_path,
                                               const std::string& output_path,
                                               Target target,
@@ -318,9 +338,28 @@ public:
                                               double target_value,
                                               const OutputOptions& options);
 
+    static Result normalize_and_save_detailed(const std::string& input_path,
+                                               const std::string& output_path,
+                                               Target target,
+                                               TargetRange target_range);
+
+    static Result normalize_and_save_detailed(const std::string& input_path,
+                                               const std::string& output_path,
+                                               Target target,
+                                               TargetRange target_range,
+                                               const OutputOptions& options);
+
     // Resource limits for hostile headers (AUD-04).
     static constexpr uint64_t kMaxTotalFrames = 1ull << 31;   // ~2.1e9 frames
     static constexpr uint64_t kMaxSamples = 1ull << 32;       // interleaved samples
+
+private:
+    static Result normalize_and_save_detailed_impl(const std::string& input_path,
+                                                   const std::string& output_path,
+                                                   Target target,
+                                                   double target_value,
+                                                   const TargetRange* target_range,
+                                                   const OutputOptions& options);
 };
 
 // ============================================================================

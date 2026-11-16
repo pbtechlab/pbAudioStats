@@ -21,7 +21,7 @@ ITU-R BS.1770-4 ラウドネス測定・トゥルーピーク検出・RMS 解析
 - **トゥルーピーク検出** — 4 倍オーバーサンプリング、96 タップの Kaiser 窓 sinc プロトタイプ（位相あたり24タップ）。メモリ／ストリーミング経路で同じスキャナを使用。
 - **サンプルピーク** (dBFS)
 - **RMS 解析** — SOX 互換の指数移動平均実装（最小／最大／平均）
-- **オーディオ正規化** — Peak / True Peak / 統合・短時間・瞬時ラウドネス / RMS 最小・最大・平均 をターゲットに指定可能
+- **オーディオ正規化** — Peak / True Peak / 統合・短時間・瞬時ラウドネス / RMS 最小・最大・平均に、単一目標値または範囲を指定可能
 - **マルチフォーマット対応** — WAV、AIFF/AIFC、MP3
 - **クロスプラットフォーム** — Windows (x64, AVX2) / macOS (Apple Silicon・Intel)
 
@@ -123,18 +123,20 @@ pbAudioStats -j8 -i ./audio_folder/
 
 ### 正規化オプション
 
-解析オプションとは排他です。必要なゲインを計算し、同一ディレクトリの一時ファイルを介して原子的に書き出します。クリップするターゲット、非有限値、無音に対する到達不能ターゲットは、出力先を置換せず拒否します。**MP3 出力は非対応** — MP3 を正規化する場合は `.wav` または `.aiff` の出力パスを指定してください。
+解析オプションとは排他です。単一値はその値へ正規化し、`値~値` は両端を含む範囲として扱います。端点の順序は問いません。`-15.1~-27.14` と `-27.14~-15.1` は同じ範囲です。現在値が範囲内ならゲインは変更せず、範囲外なら近い側の端点へ正規化します。正式な区切りは半角 `~` ですが、日本語入力向けに `～` と `〜` も受け付けます。
+
+必要なゲインは同一ディレクトリの一時ファイルを介して原子的に書き出します。クリップするターゲット、非有限値、無音に対する到達不能ターゲットは、出力先を置換せず拒否します。**MP3 出力は非対応** — MP3 を正規化する場合は `.wav` または `.aiff` の出力パスを指定してください。
 
 | オプション | 説明 | 例 |
 |--------|-------------|---------|
-| `-norm-pk:<値>` | Peak に正規化 | `-norm-pk:-1.0` |
-| `-norm-tp:<値>` | True Peak に正規化 | `-norm-tp:-1.0` |
-| `-norm-i:<値>` | 統合ラウドネスに正規化 | `-norm-i:-23.0` |
-| `-norm-s:<値>` | 短時間最大に正規化 | `-norm-s:-18.0` |
-| `-norm-m:<値>` | 瞬時最大に正規化 | `-norm-m:-18.0` |
-| `-norm-rn:<値>` | RMS 最小に正規化 | `-norm-rn:-12.0` |
-| `-norm-rm:<値>` | RMS 最大に正規化 | `-norm-rm:-12.0` |
-| `-norm-ra:<値>` | RMS 平均に正規化 | `-norm-ra:-20.0` |
+| `-norm-pk:<目標>` | Peak に正規化 | `-norm-pk:-27.14~-15.1` |
+| `-norm-tp:<目標>` | True Peak に正規化 | `-norm-tp:-2.0~-1.0` |
+| `-norm-i:<目標>` | 統合ラウドネスに正規化 | `-norm-i:-24.0~-22.0` |
+| `-norm-s:<目標>` | 短時間最大に正規化 | `-norm-s:-20.0~-18.0` |
+| `-norm-m:<目標>` | 瞬時最大に正規化 | `-norm-m:-20.0~-18.0` |
+| `-norm-rn:<目標>` | RMS 最小に正規化 | `-norm-rn:-14.0~-12.0` |
+| `-norm-rm:<目標>` | RMS 最大に正規化 | `-norm-rm:-14.0~-12.0` |
+| `-norm-ra:<目標>` | RMS 平均に正規化 | `-norm-ra:-22.0~-20.0` |
 
 ### その他のオプション
 
@@ -172,6 +174,11 @@ int main() {
         "input.wav", "output.wav",
         Normalizer::Target::Integrated, -23.0);
 
+    // Peakを-27.14〜-15.1 dBFSの範囲に収める（端点順序は不問）
+    Normalizer::normalize_and_save(
+        "input.wav", "ranged.wav", Normalizer::Target::Peak,
+        Normalizer::TargetRange{-15.1, -27.14});
+
     return 0;
 }
 ```
@@ -184,7 +191,7 @@ int main() {
 - `LoudnessMeter::measure / measure_with_rms / measure_stream` — ラウドネス（+RMS、ストリーミング経路では +トゥルーピーク）。
 - `TruePeakMeter::measure(audio[, known_sample_peak])` — 正確な 4 倍オーバーサンプリングトゥルーピーク。
 - `RMSMeter::measure` — SOX 互換 RMS。
-- `Normalizer::calculate_gain / apply_gain / normalize_and_save`。`normalize_and_save_detailed`は構造化エラーを返す。
+- `Normalizer::calculate_gain / apply_gain / normalize_and_save`。単一値と順序不問の`TargetRange`に対応し、`normalize_and_save_detailed`は構造化エラーを返す。
 
 `AnalysisOptions::memory_budget_bytes`の既定値は64 MiBで、保持するdecode済みFloat32 payloadと固定work bufferを基準にします。Full analysisは見積もり超過時にstreamへ切り替わり、MP3のfull analysisは常にstreamです。測定手順と参考値は[BENCHMARKS.md](BENCHMARKS.md)を参照してください。
 
@@ -251,3 +258,4 @@ release artifactにはversion、source commit、build条件、SHA-256 checksum�
 | 1.2.0 | 2026-05-02 | 精度＋パフォーマンス刷新（BS.1770-4 4倍オーバーサンプリング、SIMD ビット深度変換） |
 | 1.3.0 | 2026-06-12 | 極限最適化: ストリーミング型ブロック FIR トゥルーピーク（AVX2/NEON + L1 枝刈り + 終端フラッシュ）、完全バッチ化ラウドネス/RMS、O(1) ブロック集計、FTZ/DAZ、全コアスケジューリング、メモリバジェット正規化。正確性修正: 32bit PCM フルスケールオーバーフロー、ストリーミング経路の正確なトゥルーピーク、`WAVE_FORMAT_EXTENSIBLE` 対応、UTF-8 / 日本語ファイル名、PCM 書き込みの四捨五入化、AVX2 CPU ガード、堅牢なヘッダ解析。 |
 | 1.4.0 | 2026-11-10 | 安全性・移植性改善: 原子的な正規化と構造化エラー／明示的な出力精度、finite値・resource検証、channel layout対応loudness、選択解析とdecode後memory budget／MP3 streaming、True Peak・RMS境界精度改善、公開回帰・consumer test、cross-platform release check、install可能なCMake package、resource benchmark、形式・測定範囲の明文化。 |
+| 1.5.0 | 2026-11-16 | CLIの全8正規化指標へ、端点順序を問わない包含範囲正規化を追加。半角・日本語チルダ入力と、対応するライブラリAPI／回帰試験を追加。 |

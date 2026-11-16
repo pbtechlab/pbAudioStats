@@ -544,6 +544,22 @@ bool Normalizer::normalize_and_save(const std::string& input_path,
     return normalize_and_save_detailed(input_path, output_path, target, target_value, options).success;
 }
 
+bool Normalizer::normalize_and_save(const std::string& input_path,
+                                    const std::string& output_path,
+                                    Target target,
+                                    TargetRange target_range) {
+    return normalize_and_save(input_path, output_path, target, target_range, OutputOptions{});
+}
+
+bool Normalizer::normalize_and_save(const std::string& input_path,
+                                    const std::string& output_path,
+                                    Target target,
+                                    TargetRange target_range,
+                                    const OutputOptions& options) {
+    return normalize_and_save_detailed(
+        input_path, output_path, target, target_range, options).success;
+}
+
 Normalizer::Result Normalizer::normalize_and_save_detailed(
         const std::string& input_path,
         const std::string& output_path,
@@ -559,11 +575,49 @@ Normalizer::Result Normalizer::normalize_and_save_detailed(
         Target target,
         double target_value,
         const OutputOptions& options) {
+    return normalize_and_save_detailed_impl(
+        input_path, output_path, target, target_value, nullptr, options);
+}
+
+Normalizer::Result Normalizer::normalize_and_save_detailed(
+        const std::string& input_path,
+        const std::string& output_path,
+        Target target,
+        TargetRange target_range) {
+    return normalize_and_save_detailed(
+        input_path, output_path, target, target_range, OutputOptions{});
+}
+
+Normalizer::Result Normalizer::normalize_and_save_detailed(
+        const std::string& input_path,
+        const std::string& output_path,
+        Target target,
+        TargetRange target_range,
+        const OutputOptions& options) {
+    return normalize_and_save_detailed_impl(
+        input_path, output_path, target, 0.0, &target_range, options);
+}
+
+Normalizer::Result Normalizer::normalize_and_save_detailed_impl(
+        const std::string& input_path,
+        const std::string& output_path,
+        Target target,
+        double target_value,
+        const TargetRange* target_range,
+        const OutputOptions& options) {
     auto fail = [](Error error, const char* message) {
         return Result{false, error, message};
     };
 
-    if (!std::isfinite(target_value)) {
+    double range_min = 0.0;
+    double range_max = 0.0;
+    if (target_range != nullptr) {
+        if (!std::isfinite(target_range->first) || !std::isfinite(target_range->second)) {
+            return fail(Error::InvalidTarget, "Normalization range endpoints must be finite.");
+        }
+        range_min = std::min(target_range->first, target_range->second);
+        range_max = std::max(target_range->first, target_range->second);
+    } else if (!std::isfinite(target_value)) {
         return fail(Error::InvalidTarget, "Normalization target must be finite.");
     }
     if (options.dither) {
@@ -609,6 +663,10 @@ Normalizer::Result Normalizer::normalize_and_save_detailed(
         // Silent input (or measurement floor): a finite gain cannot reach the
         // target; the previous code amplified by +inf and wrote NaN samples.
         return fail(Error::UnreachableTarget, "The selected metric is not finite for this audio.");
+    }
+
+    if (target_range != nullptr) {
+        target_value = std::clamp(current_value, range_min, range_max);
     }
 
     const double gain_db = target_value - current_value;

@@ -382,6 +382,86 @@ void test_normalization_safety(const fs::path& root) {
     check(temp_count == 0, "failed writes must not leave sibling temporary files");
 }
 
+double target_metric(const AudioStats& stats, Normalizer::Target target) {
+    switch (target) {
+        case Normalizer::Target::Peak: return stats.sample_peak;
+        case Normalizer::Target::TruePeak: return stats.true_peak;
+        case Normalizer::Target::Integrated: return stats.integrated_loudness;
+        case Normalizer::Target::ShorttermMax: return stats.shortterm_max;
+        case Normalizer::Target::MomentaryMax: return stats.momentary_max;
+        case Normalizer::Target::RMSMin: return stats.rms_min;
+        case Normalizer::Target::RMSMax: return stats.rms_max;
+        case Normalizer::Target::RMSAverage: return stats.rms_average;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+void test_normalization_ranges(const fs::path& root) {
+    const AudioData source = sine_audio(4.0, 0.1f, 1);
+    const fs::path input = root / "range-source.wav";
+    check(write_pcm_wav(input, source.sample_rate, source.channels, 32, source.samples),
+          "create range normalization input");
+
+    const AudioStats before = analyze(input.u8string());
+    check(before.valid, "range normalization source must analyze");
+    if (!before.valid) return;
+
+    const std::vector<Normalizer::Target> targets = {
+        Normalizer::Target::Peak,
+        Normalizer::Target::TruePeak,
+        Normalizer::Target::Integrated,
+        Normalizer::Target::ShorttermMax,
+        Normalizer::Target::MomentaryMax,
+        Normalizer::Target::RMSMin,
+        Normalizer::Target::RMSMax,
+        Normalizer::Target::RMSAverage
+    };
+
+    for (size_t index = 0; index < targets.size(); ++index) {
+        const double current = target_metric(before, targets[index]);
+        check(std::isfinite(current), "range source metric must be finite");
+        if (!std::isfinite(current)) continue;
+
+        // Deliberately pass the higher endpoint first. The result must be the
+        // same as for ascending endpoint order and clamp down by 2 dB.
+        const double expected = current - 2.0;
+        const fs::path output = root / ("range-target-" + std::to_string(index) + ".wav");
+        const auto result = Normalizer::normalize_and_save_detailed(
+            input.u8string(), output.u8string(), targets[index],
+            Normalizer::TargetRange{expected, current - 4.0});
+        check(result.success, "range normalization must support every target");
+        const AudioStats after = analyze(output.u8string());
+        check(after.valid && near(target_metric(after, targets[index]), expected, 0.08),
+              "range normalization must clamp to the nearest endpoint");
+    }
+
+    const fs::path inside_output = root / "range-inside.wav";
+    check(Normalizer::normalize_and_save(
+              input.u8string(), inside_output.u8string(), Normalizer::Target::Peak,
+              Normalizer::TargetRange{before.sample_peak + 1.0, before.sample_peak - 1.0}),
+          "metric already inside range must succeed");
+    const AudioStats inside = analyze(inside_output.u8string());
+    check(inside.valid && near(inside.sample_peak, before.sample_peak, 0.02),
+          "metric inside range must retain unity gain");
+
+    const fs::path raised_output = root / "range-raised.wav";
+    check(Normalizer::normalize_and_save(
+              input.u8string(), raised_output.u8string(), Normalizer::Target::Peak,
+              Normalizer::TargetRange{-6.0, -8.0}),
+          "metric below range must be raised to the lower endpoint");
+    const AudioStats raised = analyze(raised_output.u8string());
+    check(raised.valid && near(raised.sample_peak, -8.0, 0.02),
+          "metric below range must clamp upward to the nearest endpoint");
+
+    const fs::path invalid_output = root / "range-invalid.wav";
+    const auto invalid = Normalizer::normalize_and_save_detailed(
+        input.u8string(), invalid_output.u8string(), Normalizer::Target::Peak,
+        Normalizer::TargetRange{-20.0, std::numeric_limits<double>::infinity()});
+    check(!invalid && invalid.error == Normalizer::Error::InvalidTarget,
+          "non-finite range endpoint must be rejected");
+    check(!fs::exists(invalid_output), "invalid range must not create output");
+}
+
 void test_aiff_rates_and_padding(const fs::path& root) {
     for (uint32_t rate : {44100u, 48000u, 96000u}) {
         std::vector<float> samples(rate / 20u, 0.25f);
@@ -728,6 +808,7 @@ int main() {
     test_rms_boundary_and_consistency();
     test_invalid_memory_inputs();
     test_normalization_safety(root);
+    test_normalization_ranges(root);
     test_aiff_rates_and_padding(root);
     test_channel_layouts(root);
     test_output_precision(root);

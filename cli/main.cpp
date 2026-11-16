@@ -119,6 +119,9 @@ struct Config {
     bool normalize = false;
     Normalizer::Target norm_target = Normalizer::Target::Peak;
     double norm_value = 0.0;
+    bool norm_is_range = false;
+    double norm_range_min = 0.0;
+    double norm_range_max = 0.0;
 
     std::string input_path;
     std::string output_path;
@@ -185,14 +188,16 @@ static void print_usage() {
     std::cout << "  -ra    RMS Average (dB)\n\n";
 
     std::cout << "Normalization Options (mutually exclusive with analysis options):\n";
-    std::cout << "  -norm-pk:<value>   Normalize to Peak value (dBFS)\n";
-    std::cout << "  -norm-tp:<value>   Normalize to True Peak value (dBTP)\n";
-    std::cout << "  -norm-i:<value>    Normalize to Integrated Loudness (LUFS)\n";
-    std::cout << "  -norm-s:<value>    Normalize to Short-term Max (LUFS)\n";
-    std::cout << "  -norm-m:<value>    Normalize to Momentary Max (LUFS)\n";
-    std::cout << "  -norm-rn:<value>   Normalize to RMS Min (dB)\n";
-    std::cout << "  -norm-rm:<value>   Normalize to RMS Max (dB)\n";
-    std::cout << "  -norm-ra:<value>   Normalize to RMS Average (dB)\n";
+    std::cout << "  Use <value> for an exact target, or <value>~<value> for an\n";
+    std::cout << "  inclusive range (endpoint order does not matter).\n";
+    std::cout << "  -norm-pk:<target>  Normalize Peak (dBFS)\n";
+    std::cout << "  -norm-tp:<target>  Normalize True Peak (dBTP)\n";
+    std::cout << "  -norm-i:<target>   Normalize Integrated Loudness (LUFS)\n";
+    std::cout << "  -norm-s:<target>   Normalize Short-term Max (LUFS)\n";
+    std::cout << "  -norm-m:<target>   Normalize Momentary Max (LUFS)\n";
+    std::cout << "  -norm-rn:<target>  Normalize RMS Min (dB)\n";
+    std::cout << "  -norm-rm:<target>  Normalize RMS Max (dB)\n";
+    std::cout << "  -norm-ra:<target>  Normalize RMS Average (dB)\n";
     std::cout << "  Note: MP3 cannot be written; normalizing an MP3 requires a\n";
     std::cout << "        .wav or .aiff output path.\n\n";
 
@@ -207,6 +212,27 @@ static void print_usage() {
     std::cout << "  pbAudioStats -i -tp input.wav\n";
     std::cout << "  pbAudioStats -f -fe -i -tp ./audio_folder/ results.csv\n";
     std::cout << "  pbAudioStats -norm-i:-23.0 input.wav output.wav\n";
+    std::cout << "  pbAudioStats -norm-pk:-27.14~-15.1 input.wav output.wav\n";
+}
+
+static bool parse_finite_number(const std::string& text, double& value) {
+    if (text.empty()) return false;
+    size_t pos = 0;
+    try {
+        value = std::stod(text, &pos);
+    } catch (...) {
+        return false;
+    }
+    return pos == text.size() && std::isfinite(value);
+}
+
+static void replace_all(std::string& text, const std::string& from,
+                        const std::string& to) {
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+    }
 }
 
 static bool parse_norm_option(const std::string& arg, Config& config) {
@@ -217,16 +243,6 @@ static bool parse_norm_option(const std::string& arg, Config& config) {
     std::string value_str = arg.substr(colon + 1);
     if (value_str.empty()) return false;
 
-    size_t pos = 0;
-    try {
-        config.norm_value = std::stod(value_str, &pos);
-    } catch (...) {
-        return false;
-    }
-    if (pos != value_str.size() || !std::isfinite(config.norm_value)) return false;
-
-    config.normalize = true;
-
     if      (type == "-norm-pk") config.norm_target = Normalizer::Target::Peak;
     else if (type == "-norm-tp") config.norm_target = Normalizer::Target::TruePeak;
     else if (type == "-norm-i")  config.norm_target = Normalizer::Target::Integrated;
@@ -236,6 +252,28 @@ static bool parse_norm_option(const std::string& arg, Config& config) {
     else if (type == "-norm-rm") config.norm_target = Normalizer::Target::RMSMax;
     else if (type == "-norm-ra") config.norm_target = Normalizer::Target::RMSAverage;
     else return false;
+
+    // Accept the documented ASCII tilde plus the two common Japanese variants.
+    replace_all(value_str, u8"～", "~");
+    replace_all(value_str, u8"〜", "~");
+    const size_t separator = value_str.find('~');
+    if (separator == std::string::npos) {
+        if (!parse_finite_number(value_str, config.norm_value)) return false;
+        config.norm_is_range = false;
+    } else {
+        if (value_str.find('~', separator + 1) != std::string::npos) return false;
+        double first = 0.0;
+        double second = 0.0;
+        if (!parse_finite_number(value_str.substr(0, separator), first) ||
+            !parse_finite_number(value_str.substr(separator + 1), second)) {
+            return false;
+        }
+        config.norm_is_range = true;
+        config.norm_range_min = std::min(first, second);
+        config.norm_range_max = std::max(first, second);
+    }
+
+    config.normalize = true;
 
     return true;
 }
@@ -567,10 +605,19 @@ static int process_normalize(const Config& config) {
         }
 
         std::cout << "Normalizing: " << input << "\n";
-        std::cout << "  Target: " << config.norm_value << " dB\n";
+        if (config.norm_is_range) {
+            std::cout << "  Target range: " << config.norm_range_min << " to "
+                      << config.norm_range_max << " dB\n";
+        } else {
+            std::cout << "  Target: " << config.norm_value << " dB\n";
+        }
 
-        const auto result = Normalizer::normalize_and_save_detailed(
-            input, output, config.norm_target, config.norm_value);
+        const auto result = config.norm_is_range
+            ? Normalizer::normalize_and_save_detailed(
+                  input, output, config.norm_target,
+                  Normalizer::TargetRange{config.norm_range_min, config.norm_range_max})
+            : Normalizer::normalize_and_save_detailed(
+                  input, output, config.norm_target, config.norm_value);
         if (!result) {
             std::cerr << "Error: " << result.message << "\n";
             return 1;
@@ -681,9 +728,15 @@ static int process_normalize(const Config& config) {
                 std::error_code mk_ec;
                 fs::create_directories(out_path.parent_path(), mk_ec);
 
-                ok = Normalizer::normalize_and_save(entries[idx].path,
-                                                    path_to_utf8(out_path),
-                                                    config.norm_target, config.norm_value);
+                if (config.norm_is_range) {
+                    ok = Normalizer::normalize_and_save(
+                        entries[idx].path, path_to_utf8(out_path), config.norm_target,
+                        Normalizer::TargetRange{config.norm_range_min, config.norm_range_max});
+                } else {
+                    ok = Normalizer::normalize_and_save(entries[idx].path,
+                                                        path_to_utf8(out_path),
+                                                        config.norm_target, config.norm_value);
+                }
             } catch (...) {
                 ok = false;
             }

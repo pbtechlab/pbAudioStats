@@ -21,7 +21,7 @@ High-performance C++17 audio analysis library and CLI with ITU-R BS.1770-4 loudn
 - **True Peak Detection** — 4× oversampling with a 96-tap Kaiser-windowed-sinc prototype (24 taps per phase). The same scanner is used for memory and streaming paths.
 - **Sample Peak** (dBFS)
 - **RMS Analysis** — SOX-compatible exponential-moving-average implementation (min / max / average)
-- **Audio Normalization** — Peak, True Peak, Integrated / Short-term / Momentary Loudness, RMS min/max/average targets
+- **Audio Normalization** — exact targets or inclusive target ranges for Peak, True Peak, Integrated / Short-term / Momentary Loudness, and RMS min/max/average
 - **Multi-format Support** — WAV, AIFF/AIFC, MP3
 - **Cross-platform** — Windows (x64, AVX2) and macOS (Apple Silicon / Intel)
 
@@ -123,18 +123,20 @@ With no analysis options and no `-norm-*`, every column is emitted. If the outpu
 
 ### Normalization Options
 
-Mutually exclusive with analysis options. The gain needed to hit the target is computed and written atomically through a sibling temporary file. A target that would clip, is non-finite, or is unreachable for silent input is rejected without replacing the destination. **MP3 output is not supported** — normalizing an MP3 requires a `.wav` or `.aiff` output path.
+Mutually exclusive with analysis options. Use one value for an exact target or `value~value` for an inclusive range. Range endpoint order does not matter: `-15.1~-27.14` and `-27.14~-15.1` are equivalent. A metric already inside the range receives unity gain; one outside is normalized to the nearest endpoint. ASCII `~` is canonical, while the CLI also accepts `～` and `〜` for Japanese input.
+
+The gain is written atomically through a sibling temporary file. A target that would clip, is non-finite, or is unreachable for silent input is rejected without replacing the destination. **MP3 output is not supported** — normalizing an MP3 requires a `.wav` or `.aiff` output path.
 
 | Option | Description | Example |
 |--------|-------------|---------|
-| `-norm-pk:<value>` | Normalize to Peak | `-norm-pk:-1.0` |
-| `-norm-tp:<value>` | Normalize to True Peak | `-norm-tp:-1.0` |
-| `-norm-i:<value>` | Normalize to Integrated Loudness | `-norm-i:-23.0` |
-| `-norm-s:<value>` | Normalize to Short-term Max | `-norm-s:-18.0` |
-| `-norm-m:<value>` | Normalize to Momentary Max | `-norm-m:-18.0` |
-| `-norm-rn:<value>` | Normalize to RMS Min | `-norm-rn:-12.0` |
-| `-norm-rm:<value>` | Normalize to RMS Max | `-norm-rm:-12.0` |
-| `-norm-ra:<value>` | Normalize to RMS Average | `-norm-ra:-20.0` |
+| `-norm-pk:<target>` | Normalize Peak | `-norm-pk:-27.14~-15.1` |
+| `-norm-tp:<target>` | Normalize True Peak | `-norm-tp:-2.0~-1.0` |
+| `-norm-i:<target>` | Normalize Integrated Loudness | `-norm-i:-24.0~-22.0` |
+| `-norm-s:<target>` | Normalize Short-term Max | `-norm-s:-20.0~-18.0` |
+| `-norm-m:<target>` | Normalize Momentary Max | `-norm-m:-20.0~-18.0` |
+| `-norm-rn:<target>` | Normalize RMS Min | `-norm-rn:-14.0~-12.0` |
+| `-norm-rm:<target>` | Normalize RMS Max | `-norm-rm:-14.0~-12.0` |
+| `-norm-ra:<target>` | Normalize RMS Average | `-norm-ra:-22.0~-20.0` |
 
 ### Other Options
 
@@ -172,6 +174,11 @@ int main() {
         "input.wav", "output.wav",
         Normalizer::Target::Integrated, -23.0);
 
+    // Keep Peak inside -27.14 to -15.1 dBFS (endpoint order is ignored)
+    Normalizer::normalize_and_save(
+        "input.wav", "ranged.wav", Normalizer::Target::Peak,
+        Normalizer::TargetRange{-15.1, -27.14});
+
     return 0;
 }
 ```
@@ -184,7 +191,7 @@ Key API surface (`lib/include/pbAudioStats.h`):
 - `LoudnessMeter::measure / measure_with_rms / measure_stream` — loudness (+RMS, +true peak in the streaming path).
 - `TruePeakMeter::measure(audio[, known_sample_peak])` — exact 4× oversampled true peak.
 - `RMSMeter::measure` — SOX-compatible RMS.
-- `Normalizer::calculate_gain / apply_gain / normalize_and_save`; `normalize_and_save_detailed` reports a structured error.
+- `Normalizer::calculate_gain / apply_gain / normalize_and_save`; exact `double` targets and order-independent `TargetRange` targets are supported, and `normalize_and_save_detailed` reports a structured error.
 
 `AnalysisOptions::memory_budget_bytes` defaults to 64 MiB for the retained decoded Float32 payload plus fixed work buffers. Full analysis streams above that estimate, and MP3 full analysis always streams. Resource/performance methodology and sample measurements are in [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -251,3 +258,4 @@ Release artifacts must record version, source commit, build conditions, and SHA-
 | 1.2.0 | 2026-05-02 | Accuracy + performance overhaul (BS.1770-4 4× oversampling, SIMD bit-depth conversion) |
 | 1.3.0 | 2026-06-12 | Extreme optimization: streaming block-FIR true peak (AVX2/NEON + L1 pruning + EOF flush), fully batched loudness/RMS, O(1) block aggregation, FTZ/DAZ, all-core scheduling, memory-budgeted normalization. Correctness fixes: 32-bit PCM full-scale overflow, exact true peak on the streaming path, `WAVE_FORMAT_EXTENSIBLE` support, UTF-8 / Japanese filenames, round-to-nearest PCM writes, AVX2 CPU guard, robust header parsing. |
 | 1.4.0 | 2026-11-10 | Safety and portability release: atomic normalization with structured errors and explicit output precision, finite/resource validation, channel-layout-aware loudness, selectable analysis with decoded-memory budgets and MP3 streaming, improved true-peak/RMS edge accuracy, public regression/consumer tests, cross-platform release checks, installable CMake package, resource benchmark, and documented format/measurement limits. |
+| 1.5.0 | 2026-11-16 | Added order-independent inclusive range normalization for all eight CLI normalization metrics, with ASCII and Japanese tilde input support and corresponding library API/regression coverage. |
